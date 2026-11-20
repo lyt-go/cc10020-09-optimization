@@ -34,6 +34,12 @@ class BackfillExecuteRequest(BaseModel):
     job_id: int
 
 
+class EndpointProgressRequest(BaseModel):
+    endpoint_id: int
+    start_date: str | None = None
+    end_date: str | None = None
+
+
 class EndpointTestRequest(BaseModel):
     endpoint_id: int
 
@@ -109,6 +115,49 @@ def pipeline_backfill_execute(request: BackfillExecuteRequest) -> dict[str, Any]
     svc = BackfillJobService()
     result = svc.execute_backfill(job_id=request.job_id)
     return result
+
+
+@router.post("/backfill-retry")
+def pipeline_backfill_retry(request: BackfillExecuteRequest) -> dict[str, Any]:
+    """链路4补: 未确认空页与失败区间重采 → 按落湖回执更新覆盖。
+
+    完整覆盖：backfill_job → data_lake_sink（落湖回执）→ endpoint_progress（台账）。
+    """
+    from app.services.backfill_job import BackfillJobService
+    svc = BackfillJobService()
+    return svc.retry_failed_intervals(job_id=request.job_id)
+
+
+@router.post("/backfill-coverage")
+def pipeline_backfill_coverage(request: BackfillExecuteRequest) -> dict[str, Any]:
+    """链路4补: 回填覆盖明细，区分确认为空与暂时未取到的区间。"""
+    from app.services.backfill_job import BackfillJobService
+    svc = BackfillJobService()
+    return svc.get_date_coverage(job_id=request.job_id)
+
+
+@router.post("/backfill-gaps")
+def pipeline_backfill_gaps(request: BackfillExecuteRequest) -> dict[str, Any]:
+    """链路4补: 按各天落湖回执确认缺口是否补齐。"""
+    from app.services.backfill_job import BackfillJobService
+    svc = BackfillJobService()
+    return svc.verify_gaps(job_id=request.job_id)
+
+
+@router.post("/endpoint-progress")
+def pipeline_endpoint_progress(request: EndpointProgressRequest) -> dict[str, Any]:
+    """链路4补: 端点进度台账 + 增量进度管理计算的可接续日期。
+
+    完整覆盖：backfill_job（覆盖记录）→ endpoint_progress（台账）→ incre_cursor（可接续日期）。
+    """
+    from app.services.backfill_job import BackfillJobService
+    from app.services.incre_cursor import IncreCursorService
+    backfill_svc = BackfillJobService()
+    cursor_svc = IncreCursorService()
+    ledger = backfill_svc.get_endpoint_progress(request.endpoint_id)
+    resumable = cursor_svc.get_resumable_dates(
+        request.endpoint_id, request.start_date, request.end_date)
+    return {"ledger": ledger, "resumable": resumable}
 
 
 @router.post("/endpoint-test")

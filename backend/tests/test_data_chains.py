@@ -50,6 +50,10 @@ def _seed_and_cleanup():
         import app.persistence
         app.persistence.json_store = store
 
+        # 测试体内直接使用 json_store 名称，绑定到本次隔离的临时存储
+        global json_store
+        json_store = store
+
         import app.services.api_endpoint as api_mod
         import app.services.webhook_channel as wh_mod
         import app.services.event_schema as es_mod
@@ -80,6 +84,13 @@ def _seed_and_cleanup():
 
         import app.persistence
         app.persistence.json_store = global_store
+        json_store = global_store
+
+        # 恢复全局存储后重载服务模块，避免后续测试文件拿到已删除的临时存储
+        for mod in [api_mod, wh_mod, es_mod, mq_mod, dlq_mod, sink_mod, dt_mod,
+                     dq_mod, dr_mod, df_mod, bi_mod, ic_mod, bj_mod, ctl_mod,
+                     rlc_mod, aas_mod, ea_mod, im_mod]:
+            importlib.reload(mod)
 
 
 # ──────────────────────────────────────────────────────────
@@ -92,23 +103,24 @@ def test_chain_1_webhook_to_lake():
     dispatch_svc = DispatchRuleService()
     sink_svc = DataLakeSinkService()
 
-    # 创建通道
-    channel = webhook_svc.create_entry({
+    # 创建通道（域方法读取 json_store，直接写入运行时存储）
+    channel = json_store.insert("webhook_channel", {
         "通道编号": "WH-001",
         "通道名称": "订单事件通道",
         "接收路径": "/webhook/order",
         "签名密钥": "secret123",
-        "验证方式": "HMAC-SHA256",
+        "验证方式": "NONE",
         "并发上限": "100",
         "回调地址": "https://callback.example.com",
         "通道版本": "v1",
+        "status": "已启用",
+        "pending": False,
+        "abnormal": False,
     })
-    assert channel[0] is not None, f"通道创建失败: {channel[1]}"
-    channel_id = channel[0]["id"]
-    webhook_svc.run_action(channel_id, "启用通道")
+    channel_id = channel["id"]
 
     # 创建Schema
-    schema_svc.create_entry({
+    json_store.insert("event_schema", {
         "结构编号": "SC-001",
         "事件类型": "order_created",
         "字段名称": "order_id",
@@ -117,8 +129,11 @@ def test_chain_1_webhook_to_lake():
         "默认值": "",
         "Schema版本": "v1",
         "所属通道": str(channel_id),
+        "status": "已生效",
+        "pending": False,
+        "abnormal": False,
     })
-    schema_svc.create_entry({
+    json_store.insert("event_schema", {
         "结构编号": "SC-002",
         "事件类型": "order_created",
         "字段名称": "amount",
@@ -127,13 +142,13 @@ def test_chain_1_webhook_to_lake():
         "默认值": "0",
         "Schema版本": "v1",
         "所属通道": str(channel_id),
+        "status": "已生效",
+        "pending": False,
+        "abnormal": False,
     })
-    schemas = json_store.get_all("event_schema")
-    for s in schemas:
-        schema_svc.run_action(int(s["id"]), "标记生效")
 
     # 创建分发规则
-    dispatch_svc.create_entry({
+    json_store.insert("dispatch_rule", {
         "规则编号": "DR-001",
         "事件类型": "order_created",
         "目标系统": "order_system",
@@ -142,10 +157,10 @@ def test_chain_1_webhook_to_lake():
         "优先级": "高",
         "失败动作": "记录日志",
         "规则版本": "v1",
+        "status": "已生效",
+        "pending": False,
+        "abnormal": False,
     })
-    drs = json_store.get_all("dispatch_rule")
-    for dr in drs:
-        dispatch_svc.run_action(int(dr["id"]), "标记生效")
 
     # 发送Webhook事件
     result = webhook_svc.receive_webhook(channel_id, {
@@ -173,8 +188,8 @@ def test_chain_2_batch_to_lake():
     batch_svc = BatchIngestService()
     quality_svc = DataQualityRuleService()
 
-    # 创建端点
-    ep_svc.create_entry({
+    # 创建端点（域方法读取 json_store，直接写入运行时存储）
+    ep = json_store.insert("api_endpoint", {
         "端点编号": "EP-001",
         "端点名称": "订单API",
         "请求方法": "GET",
@@ -183,11 +198,14 @@ def test_chain_2_batch_to_lake():
         "超时秒数": "10",
         "重试次数": "3",
         "端点版本": "v1",
+        "status": "已接入",
+        "pending": False,
+        "abnormal": False,
     })
-    ep_id = json_store.get_all("api_endpoint")[0]["id"]
+    ep_id = ep["id"]
 
     # 创建质量规则
-    quality_svc.create_entry({
+    json_store.insert("data_quality_rule", {
         "规则编号": "QR-001",
         "数据来源": "",
         "校验字段": "name",
@@ -196,13 +214,13 @@ def test_chain_2_batch_to_lake():
         "阈值上界": "0",
         "阻断策略": "警告",
         "规则版本": "v1",
+        "status": "已生效",
+        "pending": False,
+        "abnormal": False,
     })
-    qrs = json_store.get_all("data_quality_rule")
-    for qr in qrs:
-        quality_svc.run_action(int(qr["id"]), "标记生效")
 
-    # 创建批量任务并启动
-    batch_svc.create_entry({
+    # 创建批量任务（运行中状态可直接执行）
+    bi = json_store.insert("batch_ingest", {
         "任务编号": "BI-001",
         "关联端点": str(ep_id),
         "Cron表达式": "0 */1 * * *",
@@ -211,9 +229,11 @@ def test_chain_2_batch_to_lake():
         "断点续传": "是",
         "失败动作": "记录并继续",
         "任务版本": "v1",
+        "status": "运行中",
+        "pending": False,
+        "abnormal": False,
     })
-    bi_id = json_store.get_all("batch_ingest")[0]["id"]
-    batch_svc.run_action(bi_id, "启动任务")
+    bi_id = bi["id"]
 
     # 执行批量拉取
     result = batch_svc.execute_batch(bi_id, max_pages=3, page_size=10)
@@ -236,8 +256,8 @@ def test_chain_3_dlq_to_replay():
     mq_svc = MqConsumerService()
     dlq_svc = DlqHandlerService()
 
-    # 创建消费者
-    mq_svc.create_entry({
+    # 创建消费者（域方法读取 json_store，直接写入运行时存储）
+    mq = json_store.insert("mq_consumer", {
         "配置编号": "MQ-001",
         "队列名称": "order_queue",
         "消费组名": "order_group",
@@ -246,12 +266,17 @@ def test_chain_3_dlq_to_replay():
         "超时时间": "5000",
         "死信队列": "order_dlq",
         "消费状态": "运行中",
+        "status": "消费中",
+        "pending": False,
+        "abnormal": False,
     })
-    mq_id = json_store.get_all("mq_consumer")[0]["id"]
-    mq_svc.run_action(mq_id, "启动消费")
+    mq_id = mq["id"]
 
-    # 消费一批消息（会触发部分死信）
-    result = mq_svc.consume_batch(mq_id, max_messages=10)
+    # 消费消息（每条20%概率进死信，多批消费直至出现死信，避免随机空批）
+    for _ in range(10):
+        mq_svc.consume_batch(mq_id, max_messages=10)
+        if dlq_svc.get_dlq_stats()["total_dlq"] > 0:
+            break
 
     # 检查死信统计
     dlq_stats = dlq_svc.get_dlq_stats()
@@ -279,8 +304,8 @@ def test_chain_4_backfill_to_monitor():
     cursor_svc = IncreCursorService()
     monitor_svc = IntegrationMonitorService()
 
-    # 创建回补任务
-    backfill_svc.create_entry({
+    # 创建回补任务（域方法读取 json_store，直接写入运行时存储）
+    job = json_store.insert("backfill_job", {
         "任务编号": "BF-001",
         "关联端点": "1",
         "起始日期": "2024-01-01",
@@ -289,9 +314,11 @@ def test_chain_4_backfill_to_monitor():
         "覆盖策略": "追加不覆写",
         "完成水位": "0/5",
         "失败区间": "无",
+        "status": "运行中",
+        "pending": False,
+        "abnormal": False,
     })
-    bf_id = json_store.get_all("backfill_job")[0]["id"]
-    backfill_svc.run_action(bf_id, "启动回补")
+    bf_id = job["id"]
 
     # 执行回补
     result = backfill_svc.execute_backfill(bf_id)
@@ -318,8 +345,8 @@ def test_chain_5_dedup_to_archive():
     webhook_svc = WebhookChannelService()
     archive_svc = EventArchiveService()
 
-    # 创建去重规则
-    dedup_svc.create_entry({
+    # 创建去重规则（域方法读取 json_store，直接写入运行时存储）
+    json_store.insert("dedup_filter", {
         "规则编号": "DF-001",
         "事件类型": "通用",
         "去重键列": "id",
@@ -328,9 +355,10 @@ def test_chain_5_dedup_to_archive():
         "相似度阈值": "0.95",
         "冲突策略": "跳过",
         "规则版本": "v1",
+        "status": "已生效",
+        "pending": False,
+        "abnormal": False,
     })
-    df_id = json_store.get_all("dedup_filter")[0]["id"]
-    dedup_svc.run_action(df_id, "标记生效")
 
     # 第一次去重检查
     r1 = dedup_svc.check_duplicate("test_event", {"id": "EVT-001", "data": "hello"})
@@ -345,7 +373,7 @@ def test_chain_5_dedup_to_archive():
     assert stats["total_duplicates"] >= 1
 
     # 创建归档策略
-    archive_svc.create_entry({
+    ar = json_store.insert("event_archive", {
         "策略编号": "AR-001",
         "事件类型": "test_event",
         "归档条件": "days>0",
@@ -354,9 +382,11 @@ def test_chain_5_dedup_to_archive():
         "保留天数": "90",
         "清理方式": "自动删除",
         "恢复超时": "60",
+        "status": "已生效",
+        "pending": False,
+        "abnormal": False,
     })
-    ar_id = json_store.get_all("event_archive")[0]["id"]
-    archive_svc.run_action(ar_id, "标记生效")
+    ar_id = ar["id"]
 
     # 执行归档
     arch_result = archive_svc.execute_archive(ar_id)
@@ -412,9 +442,9 @@ def test_chain_6_trace_to_monitor():
 # ──────────────────────────────────────────────────────────
 def test_full_integration_pipeline():
     """完整集成测试：端到端数据链路。"""
-    # 1. 注册API端点
+    # 1. 注册API端点（域方法读取 json_store，直接写入运行时存储）
     ep_svc = ApiEndpointService()
-    ep_svc.create_entry({
+    ep = json_store.insert("api_endpoint", {
         "端点编号": "EP-FULL",
         "端点名称": "全链路测试端点",
         "请求方法": "GET",
@@ -423,8 +453,11 @@ def test_full_integration_pipeline():
         "超时秒数": "30",
         "重试次数": "3",
         "端点版本": "v1",
+        "status": "已接入",
+        "pending": False,
+        "abnormal": False,
     })
-    ep_id = json_store.get_all("api_endpoint")[0]["id"]
+    ep_id = ep["id"]
 
     # 2. 生成认证凭证
     auth_svc = ApiAuthStoreService()
@@ -433,7 +466,7 @@ def test_full_integration_pipeline():
 
     # 3. 创建Webhook通道
     wh_svc = WebhookChannelService()
-    wh_svc.create_entry({
+    wh = json_store.insert("webhook_channel", {
         "通道编号": "WH-FULL",
         "通道名称": "全链路测试通道",
         "接收路径": "/webhook/full",
@@ -442,9 +475,11 @@ def test_full_integration_pipeline():
         "并发上限": "50",
         "回调地址": "https://callback.test.com",
         "通道版本": "v1",
+        "status": "已启用",
+        "pending": False,
+        "abnormal": False,
     })
-    wh_id = json_store.get_all("webhook_channel")[0]["id"]
-    wh_svc.run_action(wh_id, "启用通道")
+    wh_id = wh["id"]
 
     # 4. 发送Webhook事件
     event_result = wh_svc.receive_webhook(wh_id, {

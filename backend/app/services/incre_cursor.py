@@ -6,7 +6,7 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.persistence import json_store
@@ -141,6 +141,56 @@ class IncreCursorService(BaseModuleService):
     def get_all_positions(self) -> dict[int, int]:
         """获取所有端点的当前水位（供监控模块批量查询）。"""
         return dict(self._positions)
+
+    def get_resumable_dates(self, endpoint_id: int, start_date: str | None = None,
+                            end_date: str | None = None) -> dict[str, Any]:
+        """使用回补日期覆盖数据计算可接续的日期。
+
+        已写入/确认为空 的日期视为已覆盖；空页未确认、查询失败、待回补
+        以及指定区间内尚无覆盖记录的日期，都是可接续（待续采）的日期。
+        跨模块关联：backfill_job（回补日期覆盖数据）。
+        """
+        from app.services.backfill_job import (
+            COVERAGE_MODULE,
+            RESOLVED_STATUSES,
+            STATUS_CONFIRMED_EMPTY,
+        )
+
+        records = [
+            r for r in json_store.get_all(COVERAGE_MODULE)
+            if str(r.get("endpoint_id", "")) == str(endpoint_id)
+        ]
+        by_date = {str(r.get("date")): r for r in records}
+
+        covered = sorted(d for d, r in by_date.items() if r.get("status") in RESOLVED_STATUSES)
+        confirmed_empty = [d for d in covered
+                           if by_date[d].get("status") == STATUS_CONFIRMED_EMPTY]
+        resumable = {d for d, r in by_date.items()
+                     if r.get("status") not in RESOLVED_STATUSES}
+
+        # 指定区间时，区间内尚无覆盖记录的日期同样可接续（暂时未取到）
+        if start_date and end_date:
+            try:
+                current = datetime.strptime(start_date, "%Y-%m-%d")
+                end = datetime.strptime(end_date, "%Y-%m-%d")
+                while current <= end:
+                    day_str = current.strftime("%Y-%m-%d")
+                    if day_str not in by_date:
+                        resumable.add(day_str)
+                    current += timedelta(days=1)
+            except ValueError:
+                pass
+
+        resumable_sorted = sorted(resumable)
+        return {
+            "ok": True,
+            "endpoint_id": endpoint_id,
+            "resumable_dates": resumable_sorted,
+            "next_resume_date": resumable_sorted[0] if resumable_sorted else None,
+            "covered_dates": covered,
+            "confirmed_empty_dates": confirmed_empty,
+            "covered_range": f"{covered[0]} ~ {covered[-1]}" if covered else "无",
+        }
 
     def domain_snapshot(self) -> dict[str, Any]:
         """输出增量水位管理的数据质量快照。"""

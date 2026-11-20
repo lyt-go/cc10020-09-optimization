@@ -201,6 +201,8 @@ class TestBatchBackfill(unittest.TestCase):
         self.backfill_svc = BackfillJobService()
         json_store.truncate("batch_ingest")
         json_store.truncate("backfill_job")
+        json_store.truncate("backfill_coverage")
+        json_store.truncate("endpoint_progress")
 
         # 创建测试接入任务
         self.task = json_store.insert("batch_ingest", {
@@ -254,6 +256,213 @@ class TestBatchBackfill(unittest.TestCase):
         progress = self.backfill_svc.get_backfill_progress(self.job["id"])
         self.assertTrue(progress["ok"])
         self.assertGreater(progress["progress_pct"], 0)
+
+
+class TestBackfillCoverage(unittest.TestCase):
+    """回补日期覆盖数据：未确认空页防漏采、中断接续与台账同步。"""
+
+    def setUp(self):
+        self.backfill_svc = BackfillJobService()
+        self.cursor_svc = IncreCursorService()
+        json_store.truncate("backfill_job")
+        json_store.truncate("backfill_coverage")
+        json_store.truncate("endpoint_progress")
+        # 2026-11-02 首次拉取为未确认空页，2026-11-04 为源端确认空页
+        self.job = json_store.insert("backfill_job", {
+            "任务编号": "BACK-COV-001",
+            "关联端点": "1",
+            "起始日期": "2026-11-01",
+            "截止日期": "2026-11-05",
+            "并行度": "2",
+            "覆盖策略": "追加不覆写",
+            "完成水位": "0/5",
+            "失败区间": "无",
+            "status": "运行中",
+            "pending": False,
+            "abnormal": False,
+        })
+
+    def _execute(self):
+        return self.backfill_svc.execute_backfill(job_id=self.job["id"])
+
+    def test_coverage_records_generated(self):
+        """执行回补后生成逐日覆盖数据，同一任务返回两种日期结果。"""
+        result = self._execute()
+        self.assertTrue(result["ok"])
+        # 两种日期结果：前一天是未确认的空页，后续日期已经写入
+        self.assertEqual(result["unconfirmed_empty_dates"], ["2026-11-02"])
+        self.assertIn("2026-11-03", result["written_dates"])
+        self.assertIn("2026-11-05", result["written_dates"])
+
+        coverage = json_store.get_all("backfill_coverage")
+        self.assertEqual(len(coverage), 5)
+        by_date = {r["date"]: r for r in coverage}
+        # 回补记录保留空页是否得到源端确认
+        self.assertEqual(by_date["2026-11-02"]["status"], "空页未确认")
+        self.assertFalse(by_date["2026-11-02"]["source_confirmed"])
+        self.assertEqual(by_date["2026-11-04"]["status"], "确认为空")
+        self.assertTrue(by_date["2026-11-04"]["source_confirmed"])
+        self.assertEqual(by_date["2026-11-01"]["status"], "已写入")
+        self.assertTrue(by_date["2026-11-01"]["receipt"])
+
+    def test_unconfirmed_empty_not_counted_as_done(self):
+        """未确认空页不计入完成水位，任务保持待续采状态，防止漏采。"""
+        self._execute()
+        job = json_store.get_by_id("backfill_job", self.job["id"])
+        self.assertEqual(job["完成水位"], "4/5")
+        self.assertNotEqual(job["status"], "已完成")
+        self.assertTrue(job["pending"])
+
+    def test_resume_finds_unconfirmed_date(self):
+        """回补中断后续做时仍能从覆盖数据中找到该日期并完成。"""
+        self._execute()
+        result2 = self._execute()
+        self.assertEqual(result2["days_processed"], 5)
+        self.assertIn("2026-11-02", result2["written_dates"])
+        job = json_store.get_by_id("backfill_job", self.job["id"])
+        self.assertEqual(job["status"], "已完成")
+        self.assertEqual(job["完成水位"], "5/5")
+
+    def test_coverage_distinguishes_empty_and_missing(self):
+        """覆盖数据可区分确认为空与暂时未取到的区间。"""
+        self._execute()
+        cov = self.backfill_svc.get_date_coverage(self.job["id"])
+        self.assertTrue(cov["ok"])
+        self.assertEqual(cov["intervals"]["确认为空"], ["2026-11-04"])
+        missing = {d["date"] for d in cov["intervals"]["暂时未取到"]}
+        self.assertEqual(missing, {"2026-11-02"})
+        self.assertEqual(len(cov["intervals"]["已写入"]), 3)
+
+    def test_retry_failed_intervals_with_coverage(self):
+        """查询失败与未确认空页都进入重试，重试后按落湖回执更新覆盖。"""
+        original = self.backfill_svc._mock_fetch_day
+
+        def flaky(endpoint_id, day, count, attempt=1):
+            if day == "2026-11-03" and attempt < 2:
+                raise RuntimeError("源端超时")
+            return original(endpoint_id, day, count, attempt)
+
+        self.backfill_svc._mock_fetch_day = flaky
+        result = self._execute()
+        self.assertIn("2026-11-03", [f["date"] for f in result["failed_intervals"]])
+        by_date = {r["date"]: r for r in json_store.get_all("backfill_coverage")}
+        self.assertEqual(by_date["2026-11-03"]["status"], "查询失败")
+
+        # 源端恢复后重试：失败与未确认空页都补齐
+        self.backfill_svc._mock_fetch_day = original
+        retry = self.backfill_svc.retry_failed_intervals(self.job["id"])
+        self.assertTrue(retry["ok"])
+        self.assertEqual(retry["still_failed"], 0)
+        self.assertEqual(retry["still_unconfirmed"], 0)
+        by_date = {r["date"]: r for r in json_store.get_all("backfill_coverage")}
+        self.assertEqual(by_date["2026-11-03"]["status"], "已写入")
+        self.assertEqual(by_date["2026-11-02"]["status"], "已写入")
+
+    def test_historical_receipt_compat(self):
+        """接续位置兼容历史回补回执：完成水位/失败区间可还原覆盖。"""
+        legacy = json_store.insert("backfill_job", {
+            "任务编号": "BACK-LEGACY-001",
+            "关联端点": "2",
+            "起始日期": "2026-11-10",
+            "截止日期": "2026-11-13",
+            "并行度": "2",
+            "覆盖策略": "追加不覆写",
+            "完成水位": "2/4",
+            "失败区间": "[{'date': '2026-11-13', 'reason': '落湖失败'}]",
+            "status": "运行中",
+            "pending": True,
+            "abnormal": True,
+        })
+        result = self.backfill_svc.execute_backfill(job_id=legacy["id"])
+        self.assertTrue(result["ok"])
+        by_date = {r["date"]: r for r in json_store.get_all("backfill_coverage")}
+        # 历史回执还原：前2天按完成水位视为已写入，不再重采
+        self.assertEqual(by_date["2026-11-10"]["receipt"], "历史回执:完成水位")
+        self.assertEqual(by_date["2026-11-11"]["receipt"], "历史回执:完成水位")
+        # 失败区间中的日期被续采补齐
+        self.assertEqual(by_date["2026-11-13"]["status"], "已写入")
+        self.assertGreater(by_date["2026-11-13"]["attempts"], 1)
+        # 无回执的缺失日期正常回补
+        self.assertEqual(by_date["2026-11-12"]["status"], "已写入")
+        job = json_store.get_by_id("backfill_job", legacy["id"])
+        self.assertEqual(job["status"], "已完成")
+
+    def test_endpoint_progress_ledger_synced(self):
+        """回补确认结果同步端点进度台账，两处日期范围取自同一份覆盖记录。"""
+        self._execute()
+        ledger = self.backfill_svc.get_endpoint_progress(1)
+        self.assertTrue(ledger["ok"])
+        self.assertEqual(ledger["ledger"]["覆盖起始日期"], "2026-11-01")
+        self.assertEqual(ledger["ledger"]["覆盖截止日期"], "2026-11-05")
+        self.assertEqual(ledger["ledger"]["已写入天数"], 3)
+        self.assertEqual(ledger["ledger"]["确认为空天数"], 1)
+        self.assertEqual(ledger["ledger"]["未解决天数"], 1)
+        # 任务上的覆盖范围与台账取自同一份覆盖记录
+        job = json_store.get_by_id("backfill_job", self.job["id"])
+        ledger_range = f"{ledger['ledger']['覆盖起始日期']} ~ {ledger['ledger']['覆盖截止日期']}"
+        self.assertEqual(job["已覆盖范围"], ledger_range)
+
+    def test_incre_cursor_resumable_dates(self):
+        """增量进度管理使用回补日期覆盖数据计算可接续的日期。"""
+        self._execute()
+        res = self.cursor_svc.get_resumable_dates(1, "2026-11-01", "2026-11-05")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["resumable_dates"], ["2026-11-02"])
+        self.assertEqual(res["next_resume_date"], "2026-11-02")
+        self.assertEqual(res["confirmed_empty_dates"], ["2026-11-04"])
+        self.assertEqual(len(res["covered_dates"]), 4)
+        # 续做完成后无可接续日期
+        self._execute()
+        res2 = self.cursor_svc.get_resumable_dates(1, "2026-11-01", "2026-11-05")
+        self.assertEqual(res2["resumable_dates"], [])
+        self.assertIsNone(res2["next_resume_date"])
+
+    def test_verify_gaps_by_lake_receipts(self):
+        """再次回补后按各天的落湖回执确认缺口是否补齐。"""
+        self._execute()
+        gaps = self.backfill_svc.verify_gaps(self.job["id"])
+        self.assertFalse(gaps["all_filled"])
+        self.assertEqual([g["date"] for g in gaps["gaps"]], ["2026-11-02"])
+        self.assertEqual(len(gaps["filled"]), 4)
+        # 已写入的日期带落湖回执
+        written = [f for f in gaps["filled"] if f["via"] == "落湖回执"]
+        self.assertEqual(len(written), 3)
+        for f in written:
+            self.assertTrue(f["receipt"])
+
+        self._execute()
+        gaps2 = self.backfill_svc.verify_gaps(self.job["id"])
+        self.assertTrue(gaps2["all_filled"])
+        self.assertEqual(gaps2["gaps"], [])
+        self.assertEqual(len(gaps2["filled"]), 5)
+
+    def test_pipeline_endpoints(self):
+        """管道API暴露回补执行、覆盖查询、重试、缺口确认与台账端点。"""
+        from fastapi.testclient import TestClient
+        from app.main import app
+        client = TestClient(app)
+
+        r = client.post("/api/pipeline/backfill-execute", json={"job_id": self.job["id"]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["unconfirmed_empty_dates"], ["2026-11-02"])
+
+        r = client.post("/api/pipeline/backfill-coverage", json={"job_id": self.job["id"]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["intervals"]["确认为空"], ["2026-11-04"])
+
+        r = client.post("/api/pipeline/backfill-retry", json={"job_id": self.job["id"]})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["still_unconfirmed"], 0)
+
+        r = client.post("/api/pipeline/backfill-gaps", json={"job_id": self.job["id"]})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["all_filled"])
+
+        r = client.post("/api/pipeline/endpoint-progress",
+                        json={"endpoint_id": 1, "start_date": "2026-11-01", "end_date": "2026-11-05"})
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.json()["ledger"]["ok"])
+        self.assertEqual(r.json()["resumable"]["resumable_dates"], [])
 
 
 class TestDedupLogic(unittest.TestCase):
